@@ -70,9 +70,15 @@ use tracing_subscriber::EnvFilter;
 
 /// Unique ID of the scripted Bolt receiver; Bolt routes are matched against it.
 const RECEIVER_UID: &str = "MOCK-BOLT-01";
+/// Unique ID of the scripted Lightspeed receiver; its device routes as
+/// [`DeviceRoute::Unifying`] because Lightspeed speaks the Unifying protocol.
+const LIGHTSPEED_UID: &str = "MOCK-LS-01";
 const MOUSE_SLOT: u8 = 1;
 const OFFLINE_SLOT: u8 = 2;
 const KEYBOARD_SLOT: u8 = 3;
+/// Slot of the scripted G305 on the Lightspeed receiver. Distinct from the
+/// Bolt slots because [`State::settings`] is keyed by device index alone.
+const G305_SLOT: u8 = 4;
 const MOCK_TORQUE: TunableTorque = match TunableTorque::try_new(50) {
     Ok(value) => value,
     Err(_) => panic!("valid mock SmartShift torque"),
@@ -318,6 +324,7 @@ impl State {
             },
         );
         settings.insert(OFFLINE_SLOT, DeviceSettings::unsupported());
+        settings.insert(G305_SLOT, g305_settings()?);
         settings.insert(
             KEYBOARD_SLOT,
             DeviceSettings {
@@ -394,7 +401,7 @@ impl State {
     fn render_inventory(&self) -> Vec<DeviceInventory> {
         let mut bolt = bolt_inventory(draining_battery(self.started.elapsed()));
         bolt.paired.extend_from_slice(&self.paired_extra);
-        vec![bolt, direct_inventory()]
+        vec![bolt, lightspeed_inventory(), direct_inventory()]
     }
 
     fn settings_for(&self, route: &DeviceRoute) -> Result<&DeviceSettings, WriteError> {
@@ -480,6 +487,9 @@ fn light_route() -> DeviceRoute {
 fn settings_key(route: &DeviceRoute) -> Option<u8> {
     match route {
         DeviceRoute::Bolt { receiver_uid, slot } if receiver_uid == RECEIVER_UID => Some(*slot),
+        DeviceRoute::Unifying { receiver_uid, slot } if receiver_uid == LIGHTSPEED_UID => {
+            Some(*slot)
+        }
         DeviceRoute::Direct {
             vendor_id: LOGITECH_VENDOR_ID,
             product_id: DIRECT_PID,
@@ -596,6 +606,93 @@ fn bolt_inventory(mouse_battery: BatteryInfo) -> DeviceInventory {
                 }),
             },
         ],
+    }
+}
+
+/// Settings the scripted G305 answers: `0x2201`-shaped DPI (200–12000,
+/// step 50), no SmartShift, and onboard profile memory. Powers up in
+/// onboard mode like the real mouse, so the Profiles panel demonstrates
+/// the host-mode switch.
+fn g305_settings() -> Result<DeviceSettings, WriteError> {
+    Ok(DeviceSettings {
+        dpi: Some(DpiState {
+            current: Dpi::new(800),
+            capabilities: DpiCapabilities::new((200u16..=12000).step_by(50).collect())?,
+        }),
+        smartshift: None,
+        onboard_profiles: Some(OnboardProfilesInfo {
+            profile_count: 1,
+            profile_count_oob: 1,
+            button_count: 6,
+            sector_count: 3,
+            sector_size: 254,
+            memory_model_id: 1,
+            profile_format_id: 1,
+            macro_format_id: 1,
+            mode: ProfilesMode::Onboard,
+            active_profile: 0x0001,
+            directory: vec![
+                ProfileEntry {
+                    sector: 1,
+                    enabled: true,
+                },
+                ProfileEntry {
+                    sector: 0x0101,
+                    enabled: true,
+                },
+            ],
+        }),
+        lighting: false,
+    })
+}
+
+/// The scripted Lightspeed nano receiver (`046d:c53f`) with a paired G305 —
+/// the wpid-`0x4074` gaming mouse: `0x2201` DPI, legacy battery, onboard
+/// profile memory, and no SmartShift or HID++-remappable buttons.
+fn lightspeed_inventory() -> DeviceInventory {
+    DeviceInventory {
+        receiver: ReceiverInfo {
+            name: "Lightspeed Receiver".to_string(),
+            vendor_id: LOGITECH_VENDOR_ID,
+            product_id: 0xc53f,
+            unique_id: Some(LIGHTSPEED_UID.to_string()),
+        },
+        paired: vec![PairedDevice {
+            slot: G305_SLOT,
+            codename: Some("G305".to_string()),
+            wpid: Some(0x4074),
+            kind: DeviceKind::Mouse,
+            online: true,
+            battery: Some(BatteryInfo {
+                percentage: 90,
+                level: BatteryLevel::Good,
+                status: BatteryStatus::Discharging,
+            }),
+            model_info: Some(DeviceModelInfo {
+                entity_count: 1,
+                serial_number: None,
+                unit_id: [0x6b, 0xe9, 0xd3, 0x00],
+                transports: DeviceTransports {
+                    usb: false,
+                    equad: true,
+                    btle: false,
+                    bluetooth: false,
+                },
+                model_ids: [0x4074, 0, 0],
+                extended_model_id: 0,
+            }),
+            capabilities: Some(Capabilities {
+                buttons: false,
+                pointer: true,
+                lighting: false,
+                scroll_inversion: false,
+                hires_wheel: false,
+                thumbwheel: false,
+                haptic_feedback: false,
+                haptic_panel: false,
+                onboard_profiles: true,
+            }),
+        }],
     }
 }
 

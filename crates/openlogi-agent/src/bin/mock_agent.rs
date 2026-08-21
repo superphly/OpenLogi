@@ -79,6 +79,9 @@ const KEYBOARD_SLOT: u8 = 3;
 /// Slot of the scripted G305 on the Lightspeed receiver. Distinct from the
 /// Bolt slots because [`State::settings`] is keyed by device index alone.
 const G305_SLOT: u8 = 4;
+/// Sensor DPI the scripted onboard profile applies when activated — distinct
+/// from the G305's power-on 800 so a profile switch visibly changes the value.
+const ONBOARD_PROFILE_DPI: Dpi = Dpi::new(1200);
 const MOCK_TORQUE: TunableTorque = match TunableTorque::try_new(50) {
     Ok(value) => value,
     Err(_) => panic!("valid mock SmartShift torque"),
@@ -1143,18 +1146,26 @@ impl Agent for MockAgent {
             return Err(WriteError::InvalidProfileSector { sector });
         }
         let mut state = self.state.lock().await;
-        let profiles = state
-            .settings_for_mut(&route)?
-            .onboard_profiles
-            .as_mut()
-            .ok_or(WriteError::FeatureUnsupported {
-                feature_hex: 0x8100,
-            })?;
+        let settings = state.settings_for_mut(&route)?;
+        let profiles =
+            settings
+                .onboard_profiles
+                .as_mut()
+                .ok_or(WriteError::FeatureUnsupported {
+                    feature_hex: 0x8100,
+                })?;
         profiles.mode = mode;
         match (mode, profile) {
             (ProfilesMode::Host, _) => profiles.active_profile = 0,
             (ProfilesMode::Onboard, Some(sector)) => profiles.active_profile = sector,
             (ProfilesMode::Onboard, None) => {}
+        }
+        // Like real hardware: entering onboard mode puts the profile's stored
+        // DPI on the sensor, so a subsequent DPI read sees the change.
+        if mode == ProfilesMode::Onboard
+            && let Some(dpi_state) = settings.dpi.as_mut()
+        {
+            dpi_state.current = ONBOARD_PROFILE_DPI;
         }
         info!(%route, ?mode, ?profile, "set_onboard_profiles");
         Ok(())

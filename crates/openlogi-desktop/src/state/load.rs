@@ -1,7 +1,7 @@
 //! Lazy per-device load state for background HID++ reads, shared by DPI,
 //! SmartShift, and onboard-profile discovery.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use openlogi_core::hid::{DpiInfo, OnboardProfilesInfo, SmartShiftStatus, WriteError};
 use tracing::debug;
@@ -70,6 +70,15 @@ pub(crate) struct LazyDeviceData<T> {
     /// Consecutive transient read failures per device, capped by
     /// [`LOAD_MAX_ATTEMPTS`] before the device settles on [`Load::Failed`].
     attempts: BTreeMap<DeviceKey, u8>,
+    /// [`Load::Ready`] entries whose payload may no longer match the device
+    /// (the value can change on-device: DPI button, onboard profile switch).
+    /// A stale entry keeps rendering its cached payload while the next render
+    /// issues a silent re-read — see [`Self::mark_stale`] /
+    /// [`Self::begin_refresh`].
+    stale: BTreeSet<DeviceKey>,
+    /// Devices with a silent refresh in flight, so a render loop doesn't
+    /// re-issue one per frame.
+    refreshing: BTreeSet<DeviceKey>,
 }
 
 // Manual `Default` (not derived): a derive would demand `T: Default`, but the
@@ -79,6 +88,8 @@ impl<T> Default for LazyDeviceData<T> {
         Self {
             by_device: BTreeMap::new(),
             attempts: BTreeMap::new(),
+            stale: BTreeSet::new(),
+            refreshing: BTreeSet::new(),
         }
     }
 }
@@ -121,6 +132,8 @@ impl<T: Clone> LazyDeviceData<T> {
     pub(crate) fn retry(&mut self, key: &DeviceKey) {
         self.by_device.remove(key);
         self.attempts.remove(key);
+        self.stale.remove(key);
+        self.refreshing.remove(key);
     }
 
     /// Forget `key` entirely — the device disappeared, or reconnected on a new
@@ -128,12 +141,71 @@ impl<T: Clone> LazyDeviceData<T> {
     pub(crate) fn remove(&mut self, key: &DeviceKey) {
         self.by_device.remove(key);
         self.attempts.remove(key);
+        self.stale.remove(key);
+        self.refreshing.remove(key);
     }
 
     /// Forget every device the `present` predicate rejects (not in the live set).
     pub(crate) fn retain_present(&mut self, present: impl Fn(&str) -> bool) {
         self.by_device.retain(|key, _| present(key.as_str()));
         self.attempts.retain(|key, _| present(key.as_str()));
+        self.stale.retain(|key| present(key.as_str()));
+        self.refreshing.retain(|key| present(key.as_str()));
+    }
+
+    /// Flag `key`'s resolved value as possibly out of date — the device can
+    /// change it on its own (DPI button press, onboard profile activation).
+    /// The cached payload keeps rendering; the next render issues a silent
+    /// re-read via [`Self::begin_refresh`]. No-op unless `key` is
+    /// [`Load::Ready`] with no refresh already in flight, so non-resolved
+    /// states keep their initial-load / retry semantics.
+    pub(crate) fn mark_stale(&mut self, key: &DeviceKey) {
+        if matches!(self.by_device.get(key), Some(Load::Ready(_))) && !self.refreshing.contains(key)
+        {
+            self.stale.insert(key.clone());
+        }
+    }
+
+    /// Claim `key`'s stale flag for a refresh read: returns `true` exactly once
+    /// per [`Self::mark_stale`], moving the key into the refresh-in-flight set
+    /// so a render loop can't issue duplicates. The result lands through
+    /// [`Self::store_refresh`], or [`Self::clear_refreshing`] if it never comes.
+    pub(crate) fn begin_refresh(&mut self, key: &DeviceKey) -> bool {
+        if self.stale.remove(key) {
+            self.refreshing.insert(key.clone());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reset a refresh whose reply was dropped, so a later
+    /// [`Self::mark_stale`] can try again.
+    pub(crate) fn clear_refreshing(&mut self, key: &DeviceKey) {
+        self.refreshing.remove(key);
+    }
+
+    /// Store a silent-refresh result: a delivered value replaces the cached
+    /// one (returned so the caller can seed derived state), while any error
+    /// keeps the previous [`Load::Ready`] on screen — a refresh must never
+    /// blank a panel that was rendering fine a frame ago.
+    pub(crate) fn store_refresh(
+        &mut self,
+        key: DeviceKey,
+        result: Result<T, WriteError>,
+        label: &'static str,
+    ) -> Option<T> {
+        self.refreshing.remove(&key);
+        match result {
+            Ok(value) => {
+                self.by_device.insert(key, Load::Ready(value.clone()));
+                Some(value)
+            }
+            Err(error) => {
+                debug!(key = %key, error = %error, label, "silent refresh failed — keeping cached value");
+                None
+            }
+        }
     }
 
     /// Optimistically record a resolved value with no read involved — e.g. a
@@ -205,5 +277,78 @@ impl<T: Clone> LazyDeviceData<T> {
         };
         self.by_device.insert(key, status);
         resolved
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openlogi_core::hid::WriteError;
+
+    use super::{DeviceKey, LazyDeviceData, Load};
+
+    fn key() -> DeviceKey {
+        DeviceKey::from("receiver:test:slot:1")
+    }
+
+    #[test]
+    fn mark_stale_only_flags_resolved_entries() {
+        let mut data = LazyDeviceData::<u8>::default();
+        // Unqueried: nothing to refresh — the initial-load path owns it.
+        data.mark_stale(&key());
+        assert!(!data.begin_refresh(&key()), "unqueried must not refresh");
+        // Loading: same — the in-flight initial read will deliver.
+        data.mark_loading(&key());
+        data.mark_stale(&key());
+        assert!(!data.begin_refresh(&key()), "loading must not refresh");
+        // Ready: stale flag arms exactly one refresh.
+        data.set_ready(key(), 7);
+        data.mark_stale(&key());
+        assert!(data.begin_refresh(&key()), "ready+stale must refresh");
+        assert!(
+            !data.begin_refresh(&key()),
+            "the stale flag is claimed once, not once per render frame"
+        );
+        // While the refresh is in flight, re-marking is a no-op.
+        data.mark_stale(&key());
+        assert!(
+            !data.begin_refresh(&key()),
+            "no duplicate in-flight refresh"
+        );
+    }
+
+    #[test]
+    fn store_refresh_keeps_the_cached_value_on_error() {
+        let mut data = LazyDeviceData::<u8>::default();
+        data.set_ready(key(), 7);
+        data.mark_stale(&key());
+        assert!(data.begin_refresh(&key()), "refresh should arm");
+        let stored = data.store_refresh(key(), Err(WriteError::DeviceNotFound), "test");
+        assert_eq!(stored, None);
+        assert_eq!(
+            data.status(&key()),
+            Load::Ready(7),
+            "a failed silent refresh must not blank the panel"
+        );
+        // The failure released the in-flight claim: staleness can re-arm.
+        data.mark_stale(&key());
+        assert!(
+            data.begin_refresh(&key()),
+            "refresh re-arms after a failure"
+        );
+        let stored = data.store_refresh(key(), Ok(9), "test");
+        assert_eq!(stored, Some(9));
+        assert_eq!(data.status(&key()), Load::Ready(9));
+    }
+
+    #[test]
+    fn remove_clears_the_stale_and_refresh_flags() {
+        let mut data = LazyDeviceData::<u8>::default();
+        data.set_ready(key(), 7);
+        data.mark_stale(&key());
+        data.remove(&key());
+        assert!(
+            !data.begin_refresh(&key()),
+            "a removed device leaves no orphaned stale flag"
+        );
     }
 }

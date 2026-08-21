@@ -98,6 +98,10 @@ impl AppState {
             self.reads.profiles.set_ready(key.clone(), info);
         }
         if route.is_some() {
+            // Switching mode or activating a profile changes the sensor DPI to
+            // whatever the target profile stores — the Pointer panel's cached
+            // read is now stale and re-reads next time it renders.
+            self.reads.dpi.mark_stale(&key);
             self.device_ui
                 .entry(key)
                 .or_default()

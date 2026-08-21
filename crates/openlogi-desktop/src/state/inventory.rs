@@ -304,12 +304,17 @@ impl AppState {
             return;
         }
         self.current_device = idx;
+        self.dpi_dragging = false;
         // A device left in `Failed` (transient read errors exhausted its retry
         // budget) gets one fresh attempt each time it is re-selected.
         if let Some(key) = self.current_record().map(DeviceRecord::device_key) {
             if matches!(self.reads.dpi.get(&key), Some(Load::Failed(_))) {
                 self.reads.dpi.retry(&key);
             }
+            // A resolved DPI may be outdated by now — the device changes it on
+            // its own (DPI button, onboard profile switch) — so re-selecting a
+            // device re-reads the current value behind the cached one.
+            self.reads.dpi.mark_stale(&key);
             if matches!(self.reads.smartshift.get(&key), Some(Load::Failed(_))) {
                 self.retry_smartshift(&key);
             }

@@ -185,6 +185,10 @@ pub struct AppState {
     /// Sorted (`BTreeMap`) for stable render order in the function-row view.
     pub keyboard_bindings: BTreeMap<KeyTrigger, Action>,
     pub dpi: Dpi,
+    /// Whether a DPI-slider drag is in progress. A silent refresh result that
+    /// lands mid-drag must not overwrite [`Self::dpi`] — the thumb is the
+    /// user's hand, not the device's report, until release.
+    pub(crate) dpi_dragging: bool,
     /// Lazily-loaded DPI, SmartShift, and onboard-profile read caches, keyed
     /// by [`DeviceKey`].
     /// HID++ reads must not block device switching or rendering, so callers
@@ -274,6 +278,7 @@ impl AppState {
             gesture_bindings: BTreeMap::new(),
             keyboard_bindings: BTreeMap::new(),
             dpi: DEFAULT_DPI,
+            dpi_dragging: false,
             reads: DeviceReads::default(),
             next_smartshift_write_id: 0,
             device_list,

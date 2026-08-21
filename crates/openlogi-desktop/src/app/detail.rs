@@ -177,6 +177,17 @@ fn detail_tabs(
         .children(tabs.iter().map(|t| t.label()))
         .on_click(cx.listener(move |this, ix: &usize, _, cx| {
             this.active_tab = order.get(*ix).copied().unwrap_or(DetailTab::Device);
+            // Entering the Pointer tab re-reads the device's current DPI
+            // behind the cached value — the device changes it on its own (DPI
+            // button, onboard profile switch), and mice without `0x1b04`
+            // diversion (e.g. the G305) give the host no event to react to.
+            if this.active_tab == DetailTab::Pointer {
+                cx.update_global::<AppState, _>(|state, _| {
+                    if let Some(key) = state.current_record().map(DeviceRecord::device_key) {
+                        state.reads.dpi.mark_stale(&key);
+                    }
+                });
+            }
             cx.notify();
         }))
 }

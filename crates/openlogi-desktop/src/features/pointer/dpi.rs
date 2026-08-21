@@ -78,23 +78,39 @@ impl DpiPanel {
     /// which are still valid DPI values. This lazy coupling is intentional:
     /// `AppState` is a global without its own GPUI context to spawn from.
     fn ensure_dpi_load(cx: &mut Context<Self>) {
-        let Some((key, route)) = dpi_load_target(cx) else {
+        if let Some((key, route)) = dpi_load_target(cx) {
+            cx.update_global::<AppState, _>(|state, _| state.reads.dpi.mark_loading(&key));
+            // The agent owns device I/O: request the DPI read over IPC and store
+            // the typed reply off the render thread. The typed `WriteError`
+            // reaches `store_dpi_info` intact, so a permanent
+            // `FeatureUnsupported` / `EmptyDpiList` stops the panel re-probing
+            // on every reselect.
+            issue_device_read(
+                cx,
+                key,
+                route,
+                crate::services::ipc::Command::ReadDpi,
+                AppState::store_dpi_info,
+                |state, key| state.reads.dpi.clear_loading(key),
+            );
             return;
-        };
-
-        cx.update_global::<AppState, _>(|state, _| state.reads.dpi.mark_loading(&key));
-        // The agent owns device I/O: request the DPI read over IPC and store the
-        // typed reply off the render thread. The typed `WriteError` reaches
-        // `store_dpi_info` intact, so a permanent `FeatureUnsupported` /
-        // `EmptyDpiList` stops the panel re-probing on every reselect.
-        issue_device_read(
-            cx,
-            key,
-            route,
-            crate::services::ipc::Command::ReadDpi,
-            AppState::store_dpi_info,
-            |state, key| state.reads.dpi.clear_loading(key),
-        );
+        }
+        // Already resolved but flagged stale (device re-selected, Pointer tab
+        // re-entered, onboard profile switched): re-read silently, keeping the
+        // cached value on screen until the fresh one lands. The device can
+        // change its own DPI — the physical DPI button never reaches the host
+        // on mice without `0x1b04` diversion (e.g. the G305), so pulling is
+        // the only way the panel tracks it.
+        if let Some((key, route)) = dpi_refresh_target(cx) {
+            issue_device_read(
+                cx,
+                key,
+                route,
+                crate::services::ipc::Command::ReadDpi,
+                AppState::store_dpi_refresh,
+                |state, key| state.reads.dpi.clear_refreshing(key),
+            );
+        }
     }
 
     fn ensure_slider(
@@ -155,7 +171,12 @@ impl DpiPanel {
                             .try_global::<AppState>()
                             .map_or(dpi, |state| state.normalize_active_dpi(dpi));
                         debug!(%dpi, "slider change → AppState.dpi");
-                        cx.update_global::<AppState, _>(|state, _| state.dpi = dpi);
+                        cx.update_global::<AppState, _>(|state, _| {
+                            state.dpi = dpi;
+                            // A silent refresh landing mid-drag must not yank
+                            // the thumb out of the user's hand.
+                            state.dpi_dragging = true;
+                        });
                         cx.notify();
                     }
                     SliderEvent::Release(value) => {
@@ -167,7 +188,10 @@ impl DpiPanel {
                         // carousel-driven device switches route the write to the
                         // now-current device, not whichever was active when this
                         // slider entity was constructed.
-                        cx.update_global::<AppState, _>(|state, _| state.commit_dpi(dpi));
+                        cx.update_global::<AppState, _>(|state, _| {
+                            state.dpi_dragging = false;
+                            state.commit_dpi(dpi);
+                        });
                     }
                 },
             );
@@ -447,5 +471,16 @@ fn dpi_load_target(cx: &mut Context<DpiPanel>) -> Option<(DeviceKey, DeviceRoute
             return None;
         }
         Some((key, record.route.clone()?))
+    })
+}
+
+/// The active device, when its resolved DPI is flagged stale — claiming the
+/// flag (see `LazyDeviceData::begin_refresh`) so one render issues one read.
+fn dpi_refresh_target(cx: &mut Context<DpiPanel>) -> Option<(DeviceKey, DeviceRoute)> {
+    cx.update_global::<AppState, _>(|state, _| {
+        let record = state.current_record()?;
+        let key = record.device_key();
+        let route = record.route.clone()?;
+        state.reads.dpi.begin_refresh(&key).then_some((key, route))
     })
 }

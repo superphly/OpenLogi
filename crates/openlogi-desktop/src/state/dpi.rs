@@ -85,6 +85,37 @@ impl AppState {
             self.dpi = info.current;
         }
     }
+    /// Store a silent DPI refresh result — issued when a [`Load::Ready`] value
+    /// was flagged stale because the device can change DPI on its own (the
+    /// physical DPI button, an onboard-profile activation). A delivered value
+    /// replaces the cache and, for the active device, re-seats the displayed
+    /// DPI unless the user is mid-drag; an error keeps the cached value on
+    /// screen. Same stale-route guard as [`Self::store_dpi_info`].
+    ///
+    /// [`Load::Ready`]: super::load::Load::Ready
+    pub fn store_dpi_refresh(
+        &mut self,
+        key: DeviceKey,
+        route: &DeviceRoute,
+        result: Result<DpiInfo, WriteError>,
+    ) {
+        let matches_route = self
+            .device_list
+            .iter()
+            .any(|record| record.device_key() == key && record.route.as_ref() == Some(route));
+        if !matches_route {
+            debug!(key = %key, "stale DPI refresh result ignored");
+            self.reads.dpi.clear_refreshing(&key);
+            return;
+        }
+        let is_active = self.current_record().is_some_and(|r| r.device_key() == key);
+        if let Some(info) = self.reads.dpi.store_refresh(key, result, "DPI")
+            && is_active
+            && !self.dpi_dragging
+        {
+            self.dpi = info.current;
+        }
+    }
     /// DPI capabilities for the active device, if discovery succeeded.
     #[must_use]
     pub fn active_dpi_capabilities(&self) -> Option<&DpiCapabilities> {

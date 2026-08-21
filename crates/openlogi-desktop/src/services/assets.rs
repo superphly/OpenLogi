@@ -242,18 +242,23 @@ impl AssetResolver {
             // The depot's manifest keys variants on one of its model ids,
             // which isn't always the index primary — the MX Master 3S
             // manifest is keyed on `2b034` while the index lists `2b043`
-            // first. Try each listed id as the variant base so the right
-            // colour render resolves regardless of which pid Logi keyed on.
+            // first — and some depots key on the depot name itself (the
+            // G305 manifest uses `g305`/`g305_ext1` while the index lists
+            // `4074`). Try each listed id and finally the depot name as the
+            // variant base so the right colour render resolves regardless
+            // of which key Logi authored the manifest against.
             // Parse the manifest once and consult it for every candidate.
             let manifest = load_manifest(&dir);
             let buttons_name = manifest.as_ref().and_then(|m| {
                 entry
                     .model_id_candidates()
+                    .chain(std::iter::once(depot))
                     .find_map(|base| buttons_image_for(m, base, model.extended_model_id))
             });
             let variant_front_name = manifest.as_ref().and_then(|m| {
                 entry
                     .model_id_candidates()
+                    .chain(std::iter::once(depot))
                     .find_map(|base| variant_image_for(m, base, model.extended_model_id))
             });
             // Front/hero render for the gallery: the colour variant's

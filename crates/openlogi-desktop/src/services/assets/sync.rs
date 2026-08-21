@@ -184,8 +184,7 @@ fn sync_depot(
         "device_buttons_image",
         "device_camera_image",
     ] {
-        let Some(variant) =
-            pick_variant_filename(&manifest_path, &entry.model_id, ext, resource_key)
+        let Some(variant) = pick_variant_filename(&manifest_path, depot, entry, ext, resource_key)
         else {
             continue;
         };
@@ -232,10 +231,15 @@ fn fetch_to_cache(
 /// `"device_camera_image"`). `ext == 0` resolves the base-model entry —
 /// needed for depots whose base render isn't a baseline `front*.png` (the
 /// caller's skip list keeps already-fetched baseline names from re-fetching).
-/// `None` when the manifest is missing, malformed, or lacks the variant.
+/// Manifests key variants on one of the entry's model ids *or* on the depot
+/// name itself (the G305 manifest uses `g305` while the index lists `4074`),
+/// so every listed id and finally the depot name is tried as the base —
+/// mirroring `resolve_files` on the render side. `None` when the manifest is
+/// missing, malformed, or lacks the variant under every base.
 fn pick_variant_filename(
     manifest_path: &Path,
-    base_model_id: &str,
+    depot: &str,
+    entry: &DeviceEntry,
     ext: u8,
     resource_key: &str,
 ) -> Option<String> {
@@ -245,8 +249,10 @@ fn pick_variant_filename(
     let manifest = DepotManifest::load_from(manifest_path)
         .map_err(|e| warn!(error = %e, path = %manifest_path.display(), "manifest unreadable"))
         .ok()?;
-    manifest
-        .resource_for_variant(base_model_id, ext, resource_key)
+    entry
+        .model_id_candidates()
+        .chain(std::iter::once(depot))
+        .find_map(|base| manifest.resource_for_variant(base, ext, resource_key))
         .map(str::to_string)
 }
 
@@ -317,10 +323,48 @@ fn source_for_sync(
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetTarget, model_key, source_for_sync, sync_retry_delay};
+    use super::{AssetTarget, model_key, pick_variant_filename, source_for_sync, sync_retry_delay};
     use openlogi_assets::AssetSource;
+    use openlogi_assets::index::DeviceEntry;
     use openlogi_core::config::AssetSourcePreference;
     use std::time::Duration;
+
+    #[test]
+    fn variant_lookup_falls_back_to_the_depot_name_base() {
+        // The G305 depot's manifest keys its variants on the depot name
+        // (`g305`, `g305_ext1`, …) while the index lists model id `4074`;
+        // without the depot-name fallback the render never downloads.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{"devices":[
+                {"modelId":"g305","resources":[{"key":"device_image","src":"front_black.png"}]},
+                {"modelId":"g305_ext2","resources":[{"key":"device_image","src":"front_white.png"}]}
+            ]}"#,
+        )
+        .expect("write manifest");
+        let entry: DeviceEntry = serde_json::from_str(
+            r#"{"modelId":"4074","displayName":"G305","type":"MOUSE","asset_path":"v1/devices/g305/","files":[]}"#,
+        )
+        .expect("device entry");
+
+        assert_eq!(
+            pick_variant_filename(&manifest_path, "g305", &entry, 0, "device_image").as_deref(),
+            Some("front_black.png"),
+            "ext 0 must resolve through the depot-name base"
+        );
+        assert_eq!(
+            pick_variant_filename(&manifest_path, "g305", &entry, 2, "device_image").as_deref(),
+            Some("front_white.png"),
+            "colour variants must resolve through the depot-name base too"
+        );
+        assert_eq!(
+            pick_variant_filename(&manifest_path, "g305", &entry, 0, "device_buttons_image"),
+            None,
+            "a resource the manifest lacks stays absent under every base"
+        );
+    }
 
     #[test]
     fn retry_delay_doubles_then_caps() {

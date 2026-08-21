@@ -9,8 +9,10 @@ body:
         OpenLogi speaks HID++ — the diagnostic output below tells us exactly what
         your device reports, which is what we need to add or fix support.
 
-        > **Known limitation:** `hidpp` currently only recognises **Logi Bolt**
-        > receivers (PID `0xC548`). Unifying and other receivers are not surfaced yet.
+        > OpenLogi recognises **Logi Bolt**, **Unifying**, and the tested
+        > **Lightspeed / Nano** receivers, plus wired and Bluetooth-direct
+        > devices. An unlisted receiver PID is exactly the kind of report we
+        > need — include the `openlogi list` output below.
 
   - type: checkboxes
     id: preflight
@@ -39,6 +41,7 @@ body:
         - Bluetooth (direct, no receiver)
         - Wired (USB cable)
         - Unifying receiver
+        - Lightspeed / Nano receiver (G-series)
         - Other / not sure
     validations:
       required: true
